@@ -436,7 +436,7 @@ impl Tool for PressKeyTool {
                                         let _ =
                                             crate::input::ax_actions::focus_element(element_ptr);
                                     }
-                                    crate::input::keyboard::press_key_bare_global(&key, &m)
+                                    crate::input::keyboard::press_key_global(&key, &m)
                                 },
                             )
                         });

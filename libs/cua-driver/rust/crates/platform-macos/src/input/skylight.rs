@@ -766,21 +766,16 @@ pub fn make_exact_window_key(target_pid: libc::pid_t, target_wid: u32) -> bool {
 /// is a bounded poll rather than a fixed sleep: an app that activates in 10 ms
 /// pays 10 ms, and a slow Catalyst/RDP surface still gets its full budget.
 ///
-/// Returns `Ok(true)` when the brief activation happened, `Ok(false)` when the
-/// fronting SPIs are unavailable (the body still ran, just without a front).
+/// Returns whether activation was needed; an already focused exact target runs
+/// without reactivating it, preserving its first responder.
+/// Missing activation support or an unconfirmed target refuses before input.
 pub fn with_foreground_assist(
     target_pid: libc::pid_t,
     target_wid: u32,
     body: impl FnOnce() -> anyhow::Result<()>,
 ) -> anyhow::Result<bool> {
-    let set_front = match set_front_process_fn() {
-        Some(f) => f,
-        None => {
-            // SPIs unavailable — run body anyway without activation.
-            body()?;
-            return Ok(false);
-        }
-    };
+    let set_front = set_front_process_fn()
+        .ok_or_else(|| anyhow::anyhow!("foreground input activation is unavailable"))?;
 
     let mut prev_psn = [0u8; 8];
     let prev_ok = get_front_process_fn()
@@ -789,18 +784,33 @@ pub fn with_foreground_assist(
 
     let mut target_psn = [0u8; 8];
     if !get_process_psn_for_window(target_wid, target_pid, &mut target_psn) {
+        anyhow::bail!("could not resolve exact window for foreground input");
+    }
+
+    if preserves_exact_existing_focus(
+        prev_ok,
+        prev_psn,
+        target_psn,
+        crate::ax::bindings::focused_window_id_of_pid(target_pid),
+        target_wid,
+    ) {
         body()?;
         return Ok(false);
     }
-
-    unsafe { set_front(target_psn.as_ptr() as *const c_void, target_wid, 0x400) };
+    if unsafe { set_front(target_psn.as_ptr() as *const c_void, target_wid, 0x400) } != 0 {
+        anyhow::bail!("WindowServer rejected foreground input activation");
+    }
     // `set_front` moves WindowServer's front process but does not make the
     // target's NSWindow key, and AppKit installs a first responder only for a
     // key window. Without this the app is "frontmost" to WindowServer while
     // remaining, from AppKit's point of view, unfocused — so the AXFocused
     // write in the body has no responder chain to attach to.
-    make_exact_window_key(target_pid, target_wid);
-    await_window_focused(target_pid, target_wid);
+    if !focus_exact_window(target_pid, target_wid) {
+        if prev_ok {
+            unsafe { set_front(prev_psn.as_ptr() as *const c_void, 0, 0x400) };
+        }
+        anyhow::bail!("exact target window did not become focused for foreground input");
+    }
 
     let result = body();
 
@@ -812,10 +822,36 @@ pub fn with_foreground_assist(
     Ok(true)
 }
 
+fn focus_exact_window(target_pid: libc::pid_t, target_wid: u32) -> bool {
+    make_exact_window_key(target_pid, target_wid);
+    // Making the process frontmost is not sufficient when another window of
+    // that same process is already key. Complete the exact-window sequence
+    // with AXRaise, as required by make_exact_window_key's contract.
+    unsafe {
+        use crate::ax::bindings::{
+            ax_get_window_id, copy_ax_windows_including, perform_action,
+            AXUIElementCreateApplication, AXUIElementSetMessagingTimeout,
+        };
+        let app = AXUIElementCreateApplication(target_pid);
+        if !app.is_null() {
+            AXUIElementSetMessagingTimeout(app, 0.25);
+            let windows = copy_ax_windows_including(app, target_pid, target_wid);
+            core_foundation::base::CFRelease(app as _);
+            for window in windows {
+                if ax_get_window_id(window) == Some(target_wid) {
+                    AXUIElementSetMessagingTimeout(window, 0.25);
+                    perform_action(window, "AXRaise");
+                }
+                core_foundation::base::CFRelease(window as _);
+            }
+        }
+    }
+    await_window_focused(target_pid, target_wid)
+}
+
 /// Upper bound on how long [`with_foreground_assist`] waits for a requested
 /// activation to become observable. Chosen to cover a Catalyst app's activation
-/// plus key-window install; past this the caller proceeds anyway so a stubborn
-/// target degrades to the old behavior instead of hanging.
+/// plus key-window install; an unconfirmed target is refused before dispatch.
 const ACTIVATION_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(400);
 
 /// Poll interval for [`await_window_focused`]. Short enough that a fast native
@@ -834,9 +870,7 @@ const ACTIVATION_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_
 /// is the same proof [`preserves_exact_existing_focus`] already trusts to decide
 /// whether a window is focused.
 ///
-/// A `false` return is not fatal: the caller proceeds with delivery regardless,
-/// because a target that never reports focus is exactly the case the pre-existing
-/// best-effort contract already covered.
+/// Callers must refuse delivery when this exact focus proof is unavailable.
 fn await_window_focused(pid: libc::pid_t, window_id: u32) -> bool {
     let deadline = std::time::Instant::now() + ACTIVATION_WAIT_TIMEOUT;
     loop {
@@ -891,30 +925,7 @@ pub fn with_foreground_hid_activation(
         anyhow::bail!("WindowServer rejected foreground HID activation");
     }
 
-    make_exact_window_key(target_pid, target_wid);
-    // Making the process frontmost is not sufficient when another window of
-    // that same process is already key. Complete the exact-window sequence
-    // with AXRaise, as required by make_exact_window_key's contract.
-    unsafe {
-        use crate::ax::bindings::{
-            ax_get_window_id, copy_ax_windows_including, perform_action,
-            AXUIElementCreateApplication, AXUIElementSetMessagingTimeout,
-        };
-        let app = AXUIElementCreateApplication(target_pid);
-        if !app.is_null() {
-            AXUIElementSetMessagingTimeout(app, 0.25);
-            let windows = copy_ax_windows_including(app, target_pid, target_wid);
-            core_foundation::base::CFRelease(app as _);
-            for window in windows {
-                if ax_get_window_id(window) == Some(target_wid) {
-                    AXUIElementSetMessagingTimeout(window, 0.25);
-                    perform_action(window, "AXRaise");
-                }
-                core_foundation::base::CFRelease(window as _);
-            }
-        }
-    }
-    if !await_window_focused(target_pid, target_wid) {
+    if !focus_exact_window(target_pid, target_wid) {
         if prev_ok {
             unsafe { set_front(prev_psn.as_ptr() as *const c_void, 0, 0x400) };
         }
