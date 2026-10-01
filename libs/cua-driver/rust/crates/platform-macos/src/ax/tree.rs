@@ -383,6 +383,16 @@ unsafe fn walk_element(
 
     let role = copy_string_attr(element, "AXRole").unwrap_or_else(|| "AXUnknown".into());
 
+    // AppKit keeps closed menu descendants in AXChildren, including enabled
+    // commands. They have no displayed menu geometry and are not current UI.
+    // Stop before recursing so hidden commands consume neither indices nor the
+    // observation budget; opening the menu exposes them on the next walk.
+    if role == "AXMenu"
+        && !element_screen_rect(element).is_some_and(|[_, _, w, h]| w > 0.0 && h > 0.0)
+    {
+        return;
+    }
+
     let in_web_content = in_web_content || is_web_content_role(&role);
 
     // Skip pure layout containers that have no interesting content.

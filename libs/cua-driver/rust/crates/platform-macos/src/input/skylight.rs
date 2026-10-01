@@ -892,6 +892,28 @@ pub fn with_foreground_hid_activation(
     }
 
     make_exact_window_key(target_pid, target_wid);
+    // Making the process frontmost is not sufficient when another window of
+    // that same process is already key. Complete the exact-window sequence
+    // with AXRaise, as required by make_exact_window_key's contract.
+    unsafe {
+        use crate::ax::bindings::{
+            ax_get_window_id, copy_ax_windows_including, perform_action,
+            AXUIElementCreateApplication, AXUIElementSetMessagingTimeout,
+        };
+        let app = AXUIElementCreateApplication(target_pid);
+        if !app.is_null() {
+            AXUIElementSetMessagingTimeout(app, 0.25);
+            let windows = copy_ax_windows_including(app, target_pid, target_wid);
+            core_foundation::base::CFRelease(app as _);
+            for window in windows {
+                if ax_get_window_id(window) == Some(target_wid) {
+                    AXUIElementSetMessagingTimeout(window, 0.25);
+                    perform_action(window, "AXRaise");
+                }
+                core_foundation::base::CFRelease(window as _);
+            }
+        }
+    }
     if !await_window_focused(target_pid, target_wid) {
         if prev_ok {
             unsafe { set_front(prev_psn.as_ptr() as *const c_void, 0, 0x400) };
