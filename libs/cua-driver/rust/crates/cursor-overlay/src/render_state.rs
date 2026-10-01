@@ -401,13 +401,18 @@ impl RenderStateCore {
                 } else {
                     speed
                 };
-                self.spring = Some(Spring {
-                    ox: 0.0,
-                    oy: 0.0,
-                    vx: impulse * 0.5 * vh.cos(),
-                    vy: impulse * 0.5 * vh.sin(),
-                });
-                self.spring_tgt = Some((end.x, end.y, end_heading));
+                if self.visual.reduced_motion != crate::ReducedMotion::On {
+                    self.spring = Some(Spring {
+                        ox: 0.0,
+                        oy: 0.0,
+                        vx: impulse * 0.5 * vh.cos(),
+                        vy: impulse * 0.5 * vh.sin(),
+                    });
+                    self.spring_tgt = Some((end.x, end.y, end_heading));
+                } else {
+                    self.spring = None;
+                    self.spring_tgt = None;
+                }
                 self.pos = (end.x, end.y);
                 self.heading = end_heading;
                 self.path = None;
@@ -513,13 +518,18 @@ impl RenderStateCore {
                 } else {
                     current_speed
                 };
-                self.spring = Some(Spring {
-                    ox: 0.0,
-                    oy: 0.0,
-                    vx: impulse * SPRING_OVERSHOOT * vh.cos(),
-                    vy: impulse * SPRING_OVERSHOOT * vh.sin(),
-                });
-                self.spring_tgt = Some((end.x, end.y, end_heading));
+                if self.visual.reduced_motion != crate::ReducedMotion::On {
+                    self.spring = Some(Spring {
+                        ox: 0.0,
+                        oy: 0.0,
+                        vx: impulse * SPRING_OVERSHOOT * vh.cos(),
+                        vy: impulse * SPRING_OVERSHOOT * vh.sin(),
+                    });
+                    self.spring_tgt = Some((end.x, end.y, end_heading));
+                } else {
+                    self.spring = None;
+                    self.spring_tgt = None;
+                }
                 self.pos = (end.x, end.y);
                 self.heading = end_heading;
                 self.path = None;
@@ -657,6 +667,10 @@ impl RenderStateCore {
                 // sentinel, snap it to the offset target so the path starts on-screen.
                 if move_to_snap_sentinel && self.pos.0 < -50.0 {
                     self.pos = (tx, ty);
+                }
+                if self.visual.reduced_motion == crate::ReducedMotion::On {
+                    self.pos = (tx, ty);
+                    self.heading = end_heading_radians;
                 }
                 let (x0, y0) = self.pos;
                 let th0 = self.heading + std::f64::consts::PI;
@@ -1086,6 +1100,37 @@ mod glide_duration_tests {
             }
         }
         t
+    }
+
+    #[test]
+    fn reduced_move_reports_arrival_without_glide_or_spring_on_every_tick_model() {
+        for tick in [
+            RenderStateCore::tick_motion,
+            RenderStateCore::tick_swift_constants,
+        ] {
+            let mut core = RenderStateCore::new(CursorConfig::default());
+            core.visual.reduced_motion = crate::ReducedMotion::On;
+            core.pos = (20.0, 30.0);
+            let heading = std::f64::consts::FRAC_PI_4;
+            core.apply_command_base(
+                OverlayCommand::MoveTo {
+                    x: 700.0,
+                    y: 400.0,
+                    end_heading_radians: heading,
+                },
+                false,
+                false,
+            );
+            let destination = (700.0 + heading.cos() * 16.0, 400.0 + heading.sin() * 16.0);
+            assert_eq!(core.pos, destination);
+            assert!(tick(&mut core, 1.0 / 60.0));
+            assert!(core.path.is_none());
+            assert!(core.spring.is_none());
+            for _ in 0..60 {
+                assert!(!tick(&mut core, 1.0 / 60.0));
+                assert_eq!(core.pos, destination);
+            }
+        }
     }
 
     #[test]

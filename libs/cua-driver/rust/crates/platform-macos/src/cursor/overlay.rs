@@ -58,6 +58,7 @@ fn arrival_register(key: CursorKey, tx: tokio::sync::oneshot::Sender<()>) {
     }
 }
 
+#[cfg(test)]
 fn arrival_fire(key: &CursorKey) {
     if let Ok(mut guard) = ARRIVAL_TX.lock() {
         if let Some(map) = guard.as_mut() {
@@ -753,11 +754,6 @@ fn render_loop(
             }
         };
 
-        // Fire arrival signals so each session's animate_cursor_to() unblocks.
-        for k in &arrived {
-            arrival_fire(k);
-        }
-
         // Repin: immediately on target change, then defensive every ~1 s while
         // the render loop is active. When quiescent, z-order is left unchanged
         // until the next command wakes the loop.
@@ -820,7 +816,16 @@ fn render_loop(
             };
 
             // Convert to CGImage and update layer on the main queue.
-            dispatch_set_layer_contents(layer_ptr, pixmap);
+            // Capture these waiters now: a newer movement can reuse a key
+            // before the main queue applies this frame.
+            let arrivals = {
+                let mut guard = ARRIVAL_TX.lock().unwrap();
+                arrived
+                    .iter()
+                    .filter_map(|key| guard.as_mut()?.remove(key))
+                    .collect()
+            };
+            dispatch_set_layer_contents(layer_ptr, pixmap, arrivals);
         }
 
         frame_tick_needed = next_frame_tick_needed;
@@ -857,7 +862,11 @@ fn cursor_is_externally_visible(state: &RenderState) -> bool {
 
 /// Convert a `tiny_skia::Pixmap` to a `CGImage` and set it as the contents
 /// of the given `CALayer` via `dispatch_async(main_queue, ...)`.
-fn dispatch_set_layer_contents(layer_ptr: usize, pixmap: tiny_skia::Pixmap) {
+fn dispatch_set_layer_contents(
+    layer_ptr: usize,
+    pixmap: tiny_skia::Pixmap,
+    arrivals: Vec<tokio::sync::oneshot::Sender<()>>,
+) {
     // Build the CGImage from the pixmap bytes.
     let cg_image_ptr = match pixmap_to_cgimage(&pixmap) {
         Some(p) => p,
@@ -865,7 +874,7 @@ fn dispatch_set_layer_contents(layer_ptr: usize, pixmap: tiny_skia::Pixmap) {
     };
 
     // Box the payload for the C callback.
-    let payload = Box::new((layer_ptr, cg_image_ptr));
+    let payload = Box::new((layer_ptr, cg_image_ptr, arrivals));
 
     // GCD symbols from libdispatch (part of the macOS system library stubs).
     // `dispatch_get_main_queue()` is an inline C function; the underlying
@@ -884,12 +893,22 @@ fn dispatch_set_layer_contents(layer_ptr: usize, pixmap: tiny_skia::Pixmap) {
     }
 
     unsafe extern "C" fn set_contents_cb(ctx: *mut c_void) {
-        let (layer_ptr, cg_image_ptr): (usize, usize) = *Box::from_raw(ctx as *mut _);
+        let (layer_ptr, cg_image_ptr, arrivals): (
+            usize,
+            usize,
+            Vec<tokio::sync::oneshot::Sender<()>>,
+        ) = *Box::from_raw(ctx as *mut _);
         let layer = layer_ptr as *mut objc2::runtime::AnyObject;
         // setContents: expects an `id` (type '@'), not a raw void pointer.
         // CGImageRef is toll-free bridged to NSObject, so we cast it to *mut AnyObject.
         let cg_id = cg_image_ptr as *mut objc2::runtime::AnyObject;
         let _: () = objc2::msg_send![layer, setContents: cg_id];
+        let _: () = objc2::msg_send![objc2::class!(CATransaction), flush];
+        // A path-end notification belongs to the applied frame, not to an
+        // earlier model tick or merely scheduling this callback.
+        for arrival in arrivals {
+            let _ = arrival.send(());
+        }
         // Release the CGImage ref we retained in pixmap_to_cgimage.
         CGImageRelease(cg_image_ptr as *mut c_void);
     }

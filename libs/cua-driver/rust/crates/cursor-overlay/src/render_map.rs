@@ -679,6 +679,9 @@ mod tests {
         let mut map = map();
         let core = placed(&mut map, DEFAULT_CURSOR_KEY);
         core.visual.reduced_motion = ReducedMotion::On;
+        // The opaque delay must outlast the navigation badge. Reduced motion
+        // arrives without the spring that used to reset the idle countdown.
+        core.motion.idle_hide_ms = (crate::CursorAction::Navigate.duration_secs() + 1.0) * 1000.0;
         core.apply_command_base(
             OverlayCommand::MoveTo {
                 x: 250.0,
@@ -699,7 +702,7 @@ mod tests {
 
         let wait = map.idle_fade_wait().expect("idle fade deadline");
         let core = &mut map.cursors[DEFAULT_CURSOR_KEY];
-        assert!(wait > Duration::ZERO && wait <= Duration::from_millis(500));
+        assert!(wait > Duration::ZERO && wait <= Duration::from_secs(1));
         // Wake just past the deadline, as a parked loop's timeout does.
         core.tick_motion(wait.as_secs_f64() + 0.001);
         assert!(core.idle_fade_in_progress());
