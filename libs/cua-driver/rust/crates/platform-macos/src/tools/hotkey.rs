@@ -404,13 +404,7 @@ impl Tool for HotkeyTool {
                             crate::input::skylight::with_foreground_hid_activation(
                                 pid as libc::pid_t,
                                 wid,
-                                || {
-                                    if screen_sharing_target {
-                                        crate::input::keyboard::press_key_global(&key, &m)
-                                    } else {
-                                        crate::input::keyboard::press_key_global(&key, &m)
-                                    }
-                                },
+                                || crate::input::keyboard::press_key_global(&key, &m),
                             )?;
                             Ok(())
                         }
